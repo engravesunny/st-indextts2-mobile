@@ -1,12 +1,23 @@
 (function () {
     const extensionName = "st-indextts2";
-    const extensionFolderPath = `scripts/extensions/third-party/${extensionName}/`;
+    const extensionFolderPath = 'scripts/extensions/third-party/st-indextts2-mobile/';
+    const mobileRelay = '/api/plugins/indextts2-mobile';
+    const voiceBase = 'http://127.0.0.1:7880';
+    const installedVoiceNames = [
+        'default', 'gentle_N10', '七柒', '千雪', '古风少女', '夹子', '妇女', '娇妻', '学姐', '少御',
+        '御妈', '御姐', '性感', '温御', '男_青年音', '男_玄幻小说旁白', '病娇', '老师', '老奶奶',
+        '萝莉', '软妹', '示例-扩展测试音色', '示例-JP音色中文', '示例-JP音色日文', '示例-JP音色英文',
+        'nsfw_娇妻', 'nsfw_少御', 'nsfw_母系小烟', 'nsfw_母系小瑶', 'nsfw_老师',
+    ].map(name => `${name}.wav`);
+    let relayProbe;
+    let relayProbeExpires = 0;
 
     // ==================== Default Settings ====================
     const defaultSettings = {
-        apiUrl: 'http://127.0.0.1:7880/api/v1/tts/tasks',
-        cloningUrl: 'http://127.0.0.1:7880/api/v1/indextts2_cloning',
-        voiceListUrl: 'http://127.0.0.1:7880/api/v1/voices', // 获取参考音频列表
+        apiUrl: `${voiceBase}/api/v1/tts/tasks`,
+        cloningUrl: `${voiceBase}/api/v1/indextts2_cloning`,
+        voiceListUrl: `${voiceBase}/api/v1/voices`,
+        mobileTransport: 'auto',
         model: 'index-tts2',
         defaultVoice: 'default.wav',
         speed: 1.0,
@@ -55,6 +66,101 @@
             console.warn('[IndexTTS2] getContext error:', e);
         }
         return null;
+    }
+
+    function directEndpoint(value, path) {
+        const saved = String(value || '').trim();
+        if (!saved || saved === `http://127.0.0.1:7880${path}`) return voiceBase + path;
+        return saved;
+    }
+
+    function directFetch(url, options = {}) {
+        const address = new URL(url, location.href);
+        const privateIPv4 = /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)\d+(?:\.\d+){1,2}$/;
+        const local = address.protocol === 'http:' && privateIPv4.test(address.hostname);
+        return fetch(address, { ...options, mode: 'cors', ...(local ? { targetAddressSpace: 'local' } : {}) });
+    }
+
+    function timeoutSignal(ms) {
+        if (typeof AbortSignal.timeout === 'function') return AbortSignal.timeout(ms);
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(), ms);
+        return controller.signal;
+    }
+
+    function fieldValue(value) {
+        return value.replace(/[&"<>]/g, character => ({ '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' })[character]);
+    }
+
+    async function useMobileRelay(settings) {
+        if (settings.mobileTransport === 'direct') return false;
+        if (settings.mobileTransport === 'relay') return true;
+        if (Date.now() >= relayProbeExpires) {
+            relayProbeExpires = Date.now() + 5000;
+            relayProbe = fetch(`${mobileRelay}/status`, { cache: 'no-store', signal: timeoutSignal(2500) })
+                .then(async res => res.ok && (await res.json()).bridge === 'indextts2-mobile')
+                .catch(() => false);
+        }
+        return relayProbe;
+    }
+
+    function relayPost(path, payload) {
+        return fetch(mobileRelay + path, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...getContext()?.getRequestHeaders?.() },
+            body: JSON.stringify(payload),
+        });
+    }
+
+    async function loadVoiceNames(settings) {
+        const relay = await useMobileRelay(settings);
+        const url = directEndpoint(settings.voiceListUrl, '/api/v1/voices');
+        const signal = timeoutSignal(6500);
+        const res = relay
+            ? await fetch(`${mobileRelay}/voices`, { signal, cache: 'no-store' })
+            : await directFetch(url, { signal, cache: 'no-store' });
+        const type = res.headers.get('content-type') ?? '';
+        const data = type.includes('application/json') ? await res.json() : null;
+        if (!res.ok) throw new Error(data?.detail || (res.status === 404 && relay ? '手机端中继尚未安装或启用。' : `HTTP ${res.status}`));
+        const entries = Array.isArray(data) ? data : data?.voices;
+        if (!Array.isArray(entries)) throw new Error('音频列表地址未返回音色清单。');
+        const names = entries.map(v => typeof v === 'string' ? v : v?.filename || v?.name)
+            .filter(name => typeof name === 'string' && name.trim());
+        return { names: [...new Set(names)], relay };
+    }
+
+    function pickAudioFiles(onFiles, accept) {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.multiple = true;
+        input.accept = accept;
+        input.hidden = true;
+        document.body.append(input);
+        input.addEventListener('cancel', () => input.remove(), { once: true });
+        input.addEventListener('change', async () => {
+            const files = Array.from(input.files ?? []);
+            input.remove();
+            if (!files.length) return;
+            try { await onFiles(files); }
+            catch (e) { window.toastr?.error(`导入失败：${e.message}`); }
+        }, { once: true });
+        input.click();
+    }
+
+    async function importSceneFiles(files) {
+        const filesToSave = files.filter(file => /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(file.name)
+            && file.size > 0 && file.size <= 32 * 1024 * 1024);
+        if (!filesToSave.length) throw new Error('未选中可用的音频文件。');
+        const previous = await AudioStorage.getConfig('mobileSceneNames');
+        const names = new Set(Array.isArray(previous) ? previous : []);
+        for (const file of filesToSave) {
+            const name = file.name.replace(/\.[^.]+$/, '').normalize('NFC');
+            await AudioStorage.saveConfig(`mobileScene:${name}`, file);
+            names.add(name);
+        }
+        await AudioStorage.saveConfig('mobileSceneNames', [...names]);
+        if (!(await AudioStorage.getConfig('mobileSceneNames'))) throw new Error('酒馆无法保存本地音频。');
+        return names.size;
     }
 
     /**
@@ -609,6 +715,10 @@
         }
 
         async function _loadScene(sceneName) {
+            let local;
+            try { local = await AudioStorage.getConfig(`mobileScene:${sceneName.trim().normalize('NFC')}`); }
+            catch (error) { console.warn('[IndexTTS2] 读取手机背景音失败', error); }
+            if (local instanceof Blob && local.size > 0) return URL.createObjectURL(local);
             console.log('[IndexTTS2][Ambient] _loadScene: sceneName=' + sceneName + ' dirHandle=' + (dirHandle ? dirHandle.name : 'NULL'));
             if (!dirHandle) { console.warn('[IndexTTS2][Ambient] _loadScene: dirHandle is null, 请在设置中选择背景音目录'); return null; }
             try {
@@ -1041,12 +1151,13 @@
         });
 
         try {
-            const res = await fetch(settings.apiUrl, {
-                method: 'POST',
-                mode: 'cors',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
+            const route = await useMobileRelay(settings);
+            const res = route ? await relayPost('/speech', payload)
+                : await directFetch(directEndpoint(settings.apiUrl, '/api/v1/tts/tasks'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
 
             if (!res.ok) {
                 const errText = await res.text().catch(() => '');
@@ -1213,33 +1324,20 @@
         console.log(`[IndexTTS2] Clone: ${characterName}, base64 len=${base64Audio.length}`);
 
         try {
-            // 将 base64 转换为 Blob，使用 multipart/form-data 上传到 /api/v1/upload
-            const byteString = atob(base64Audio);
-            const ab = new ArrayBuffer(byteString.length);
-            const ia = new Uint8Array(ab);
-            for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i);
-            const blob = new Blob([ab], { type: 'audio/wav' });
-
-            // 直接使用原始文件名，不做任何重命名或过滤
             const uploadFileName = originalFileName || (characterName + '.wav');
-
-            const formData = new FormData();
-            formData.append('file', blob, uploadFileName);
-
-            // 从 cloningUrl 提取 baseUrl，换用后端已有的 /api/v1/upload 接口
-            const baseUrl = (settings.cloningUrl || 'http://127.0.0.1:7880/api/v1/indextts2_cloning')
-                .replace(/\/api\/v1\/indextts2_cloning.*$/, '')
-                .replace(/\/+$/, '');
-            const uploadUrl = baseUrl + '/api/v1/upload';
-
-            console.log(`[IndexTTS2] Uploading to: ${uploadUrl}, filename: ${uploadFileName}`);
-
-            const res = await fetch(uploadUrl, {
-                method: 'POST',
-                mode: 'cors',
-                body: formData
-                // 不手动设置 Content-Type，让浏览器自动附加 multipart boundary
-            });
+            if (base64Audio.length > 20 * 1024 * 1024) throw new Error('参考音频太大，请截取一小段后再上传。');
+            const route = await useMobileRelay(settings);
+            let res;
+            if (route) {
+                res = await relayPost('/upload', { filename: uploadFileName, audio: base64Audio });
+            } else {
+                const bytes = Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0));
+                const form = new FormData();
+                form.set('file', new Blob([bytes], { type: 'audio/wav' }), uploadFileName);
+                const baseUrl = directEndpoint(settings.cloningUrl, '/api/v1/indextts2_cloning')
+                    .replace(/\/api\/v1\/indextts2_cloning.*$/, '').replace(/\/+$/, '');
+                res = await directFetch(baseUrl + '/api/v1/upload', { method: 'POST', body: form });
+            }
 
             const text = await res.text();
             console.log(`[IndexTTS2] Upload response: ${res.status}`, text);
@@ -1326,6 +1424,7 @@
                     <button class="menu_button" id="indextts-import"><i class="fa-solid fa-file-import"></i> 导入全部</button>
                     <button class="menu_button" id="indextts-export"><i class="fa-solid fa-file-export"></i> 导出全部</button>
                 </div>
+                <div id="indextts-voice-list-state" role="status"></div>
                 <div class="indextts-char-list" id="indextts-char-list-container"></div>
                 <div class="indextts-popup-footer">
                     <button class="menu_button" id="indextts-cancel">取消</button>
@@ -1503,45 +1602,42 @@
                 };
             });
 
-            // 下拉选择框：从后端获取音频列表并填充
             const settings = getSettings();
-            const voiceListUrl = settings.voiceListUrl || 'http://127.0.0.1:7880/api/v1/voices';
+            const listUrl = directEndpoint(settings.voiceListUrl, '/api/v1/voices');
+            const catalogKey = `voiceCatalog:${settings.mobileTransport}:${listUrl}`;
+            const state = modal.querySelector('#indextts-voice-list-state');
+            const selects = [...container.querySelectorAll('.indextts-voice-select')];
+            const inputs = [...container.querySelectorAll('.indextts-voice-input')];
+            function fillChoices(names) {
+                for (const sel of selects) {
+                    const char = sel.dataset.char;
+                    const currentVoice = voiceMap[char] || '';
+                    sel.replaceChildren(new Option('-- 请选择参考音频 --', ''), ...names.map(name => new Option(name, name)));
+                    if (currentVoice && !names.includes(currentVoice)) sel.add(new Option(`${currentVoice}（手动）`, currentVoice));
+                    sel.value = currentVoice;
+                    sel.onchange = () => {
+                        voiceMap[char] = sel.value;
+                        const input = inputs.find(item => item.dataset.char === char);
+                        if (input) input.value = sel.value;
+                        saveSettings();
+                    };
+                }
+            }
 
-            // 一次性拉取音频列表，填充所有 select
-            fetch(voiceListUrl, { mode: 'cors' })
-                .then(r => r.json())
-                .then(data => {
-                    // 后端返回 { voices: [...], directory: ... }
-                    const voices = Array.isArray(data) ? data : (data.voices || []);
-                    container.querySelectorAll('.indextts-voice-select').forEach(sel => {
-                        const char = sel.dataset.char;
-                        const currentVoice = voiceMap[char] || '';
-                        sel.innerHTML = '<option value="">-- 请选择参考音频 --</option>'
-                            + voices.map(v => {
-                                const name = typeof v === 'string' ? v : (v.filename || v.name || v);
-                                return `<option value="${name}"${name === currentVoice ? ' selected' : ''}>${name}</option>`;
-                            }).join('');
-                        // 如果当前值不在列表中但手动输入了，补一个 option
-                        if (currentVoice && !voices.some(v => (typeof v === 'string' ? v : (v.filename || v.name)) === currentVoice)) {
-                            sel.innerHTML += `<option value="${currentVoice}" selected>${currentVoice} (手动)</option>`;
-                        }
-                        sel.onchange = () => {
-                            const val = sel.value;
-                            voiceMap[char] = val;
-                            const voiceInput = container.querySelector(`.indextts-voice-input[data-char="${char}"]`);
-                            if (voiceInput) voiceInput.value = val;
-                            saveSettings();
-                        };
-                    });
-                })
-                .catch(() => {
-                    container.querySelectorAll('.indextts-voice-select').forEach(sel => {
-                        const char = sel.dataset.char;
-                        const currentVoice = voiceMap[char] || '';
-                        sel.innerHTML = `<option value="" disabled>⚠ 无法获取列表</option>`
-                            + (currentVoice ? `<option value="${currentVoice}" selected>${currentVoice}</option>` : '');
-                    });
-                });
+            state.textContent = '正在读取音色列表…';
+            loadVoiceNames(settings).then(({ names, relay }) => {
+                if (!selects[0]?.isConnected) return;
+                fillChoices(names);
+                state.textContent = `${relay ? '手机中继' : '局域网直连'} · ${names.length} 条音色`;
+                AudioStorage.saveConfig(catalogKey, names).catch(() => {});
+            }).catch(async error => {
+                const saved = await AudioStorage.getConfig(catalogKey).catch(() => null);
+                if (!selects[0]?.isConnected) return;
+                const names = Array.isArray(saved) ? saved : installedVoiceNames;
+                fillChoices(names);
+                const reason = error instanceof TypeError ? 'App 内的网络请求失败，请检查中继或局域网权限。' : error.message;
+                state.textContent = names.length ? `已显示 ${names.length} 条离线音色。${reason}` : `音色列表读取失败。${reason}`;
+            });
         }
     }
 
@@ -3105,13 +3201,19 @@
             // Panel exists, check if we need to update values from external changes (e.g. init load)
             const settings = getSettings();
 
-            // Sync values if they don't match (simple one-way binding check)
-            const urlInput = document.getElementById('indextts-url');
-            if (urlInput && urlInput.value !== settings.apiUrl) urlInput.value = settings.apiUrl;
+            const fields = {
+                'indextts-url': directEndpoint(settings.apiUrl, '/api/v1/tts/tasks'),
+                'indextts-clone-url': directEndpoint(settings.cloningUrl, '/api/v1/indextts2_cloning'),
+                'indextts-voice-list-url': directEndpoint(settings.voiceListUrl, '/api/v1/voices'),
+                'indextts-mobile-transport': settings.mobileTransport,
+            };
+            for (const [id, value] of Object.entries(fields)) {
+                const input = document.getElementById(id);
+                if (input && document.activeElement !== input && input.value !== value) input.value = value;
+            }
 
-            // ... (We could do this for all fields, but usually re-injection isn't frequent if ID check prevents it)
-            // However, for the path specifically, we want to ensure it's up to date
-            const pathMsg = settings.cacheImportPath || '未设置本地目录';
+            const cachePath = settings.cacheImportPath;
+            const pathMsg = cachePath && cachePath !== defaultSettings.cacheImportPath ? cachePath : '未设置本地目录';
             const pathInput = document.getElementById('indextts-local-path');
             if (pathInput && pathInput.value !== pathMsg) pathInput.value = pathMsg;
 
@@ -3159,16 +3261,33 @@
                         <div class="indextts-setting-module">
                             <div class="indextts-module-header">🔌 服务配置</div>
                             <div class="indextts-setting-row">
+                                <label for="indextts-mobile-transport">连接方式</label>
+                                <select id="indextts-mobile-transport" class="text_pole">
+                                    <option value="auto" ${settings.mobileTransport === 'auto' ? 'selected' : ''}>自动选择</option>
+                                    <option value="relay" ${settings.mobileTransport === 'relay' ? 'selected' : ''}>手机本机中继</option>
+                                    <option value="direct" ${settings.mobileTransport === 'direct' ? 'selected' : ''}>局域网直连</option>
+                                </select>
+                            </div>
+                            <div class="indextts-setting-row">
+                                <button type="button" class="menu_button" id="indextts-test-connection">测试音色连接</button>
+                                <span id="indextts-mobile-status" role="status"></span>
+                            </div>
+                            <div class="indextts-setting-row">
+                                <label for="indextts-base-url">电脑语音服务地址</label>
+                                <input type="url" id="indextts-base-url" placeholder="http://电脑局域网IP:7880" class="text_pole">
+                                <button type="button" class="menu_button" id="indextts-apply-base">应用到三个接口</button>
+                            </div>
+                            <div class="indextts-setting-row">
                                 <label>TTS 服务地址</label>
-                                <input type="text" id="indextts-url" class="text_pole" value="${settings.apiUrl}">
+                                <input type="text" id="indextts-url" class="text_pole" value="${fieldValue(directEndpoint(settings.apiUrl, '/api/v1/tts/tasks'))}">
                             </div>
                             <div class="indextts-setting-row">
                                 <label>音色克隆地址</label>
-                                <input type="text" id="indextts-clone-url" class="text_pole" value="${settings.cloningUrl}">
+                                <input type="text" id="indextts-clone-url" class="text_pole" value="${fieldValue(directEndpoint(settings.cloningUrl, '/api/v1/indextts2_cloning'))}">
                             </div>
                             <div class="indextts-setting-row">
                                 <label>音频列表地址</label>
-                                <input type="text" id="indextts-voice-list-url" class="text_pole" value="${settings.voiceListUrl || 'http://127.0.0.1:7880/api/v1/voices'}">
+                                <input type="text" id="indextts-voice-list-url" class="text_pole" value="${fieldValue(directEndpoint(settings.voiceListUrl, '/api/v1/voices'))}">
                             </div>
                              <div class="indextts-setting-row">
                                 <label>推理模型名称</label>
@@ -3253,7 +3372,7 @@
                             <div class="indextts-module-header">🎙️ 参考音频&缓存管理</div>
                              <div class="indextts-path-container">
                                 <input type="text" id="indextts-local-path" class="indextts-path-display" value="${pathDisplay}" readonly title="${pathDisplay}">
-                                <button class="menu_button" id="indextts-choose-folder" title="选择本地文件夹">📂 选择</button>
+                                <button class="menu_button" id="indextts-choose-folder" title="选择本地文件夹">📂 选目录</button>
                                 <button class="menu_button indextts-auth-btn" id="indextts-auth-btn" title="需授权读写权限" style="display:none;">🔄 授权</button>
                             </div>
                             
@@ -3261,6 +3380,7 @@
                                 <div>已缓存音频: <span id="indextts-cache-count">0</span> 条</div>
                                 <div class="indextts-audio-pool-actions">
                                     <button class="menu_button" id="indextts-scan-import" title="扫描本地目录">📥 扫描导入</button>
+                                    <button class="menu_button" id="indextts-import-files" title="从手机选择音频或缓存备份">导入文件</button>
                                     <button class="menu_button" id="indextts-export-cache" title="导出备份">📂 导出备份</button>
                                     <button class="menu_button" id="indextts-clear-cache" title="清空缓存">🗑️ 清空全部</button>
                                 </div>
@@ -3272,8 +3392,12 @@
                             <div class="indextts-module-header">🎵 场景音效</div>
                             <div class="indextts-path-container">
                                 <input type="text" id="indextts-ambient-path" class="indextts-path-display" value="" readonly placeholder="未选择背景音目录">
-                                <button class="menu_button" id="indextts-ambient-choose" title="选择背景音文件夹">📂 选择</button>
+                                <button class="menu_button" id="indextts-ambient-choose" title="选择背景音文件夹">📂 选目录</button>
                                 <button class="menu_button" id="indextts-ambient-auth" title="重新授权目录读取权限" style="display:none;">🔄 授权</button>
+                            </div>
+                            <div class="indextts-setting-row">
+                                <button type="button" class="menu_button" id="indextts-ambient-files">导入背景音文件</button>
+                                <span id="indextts-mobile-scene-count" role="status"></span>
                             </div>
                             <div class="indextts-setting-row">
                                 <label>场景音音量</label>
@@ -3328,6 +3452,44 @@
         bindInput('#indextts-clone-url', 'cloningUrl');
         bindInput('#indextts-voice-list-url', 'voiceListUrl');
         bindInput('#indextts-model', 'model');
+
+        panel.querySelector('#indextts-mobile-transport').onchange = event => {
+            getSettings().mobileTransport = event.target.value;
+            relayProbeExpires = 0;
+            panel.querySelector('#indextts-mobile-status').textContent = '';
+            saveSettings();
+        };
+        panel.querySelector('#indextts-test-connection').onclick = async event => {
+            const button = event.currentTarget;
+            const status = panel.querySelector('#indextts-mobile-status');
+            button.disabled = true;
+            status.textContent = '测试中…';
+            try {
+                relayProbeExpires = 0;
+                const { names, relay } = await loadVoiceNames(getSettings());
+                status.textContent = `${relay ? '手机中继' : '局域网直连'}成功 · ${names.length} 条音色`;
+            } catch (error) { status.textContent = `连接失败：${error.message}`; }
+            finally { button.disabled = false; }
+        };
+
+        panel.querySelector('#indextts-apply-base').onclick = () => {
+            const field = panel.querySelector('#indextts-base-url');
+            const status = panel.querySelector('#indextts-mobile-status');
+            try {
+                const base = new URL(field.value.trim());
+                if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash) {
+                    throw new Error('请填入 HTTP 或 HTTPS 服务地址。');
+                }
+                const settings = getSettings();
+                const prefix = base.href.replace(/\/+$/, '');
+                settings.apiUrl = `${prefix}/api/v1/tts/tasks`;
+                settings.cloningUrl = `${prefix}/api/v1/indextts2_cloning`;
+                settings.voiceListUrl = `${prefix}/api/v1/voices`;
+                saveSettings();
+                injectSettingsPanel();
+                status.textContent = '服务地址已保存，可以测试连接。';
+            } catch (error) { status.textContent = `地址无效：${error.message}`; }
+        };
 
         // 2. Playback & Automation
         const bindSelect = (id, field) => {
@@ -3470,11 +3632,20 @@
         bindPrompt('#indextts-prompt-content', 'content');
 
         // ==================== Module 4: Ambient Sound ====================
+        const sceneCount = panel.querySelector('#indextts-mobile-scene-count');
+        function showSceneCount(count) { sceneCount.textContent = count ? `手机已导入 ${count} 条` : ''; }
+        AudioStorage.getConfig('mobileSceneNames').then(names => showSceneCount(names?.length)).catch(() => {});
+        const chooseSceneFiles = () => pickAudioFiles(async files => {
+            const count = await importSceneFiles(files);
+            showSceneCount(count);
+            window.toastr?.success(`手机已保存 ${count} 条背景音`);
+        }, 'audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac');
+        panel.querySelector('#indextts-ambient-files').onclick = chooseSceneFiles;
         const ambientChooseBtn = panel.querySelector('#indextts-ambient-choose');
         if (ambientChooseBtn) {
             ambientChooseBtn.onclick = async () => {
                 if (!window.showDirectoryPicker) {
-                    if (window.toastr) window.toastr.error('浏览器不支持目录选择');
+                    chooseSceneFiles();
                     return;
                 }
                 try {
@@ -3490,7 +3661,7 @@
                     saveSettings();
                     if (window.toastr) window.toastr.success('背景音目录已设置: ' + h.name);
                 } catch (e) {
-                    if (e.name !== 'AbortError') console.error('[IndexTTS2][Ambient]', e);
+                    if (e.name !== 'AbortError') window.toastr?.warning('目录选择不可用，请点「导入背景音文件」。');
                 }
             };
             // Init display - 优先使用 handle，备用 settings
@@ -3569,7 +3740,7 @@
             let displayPath = '未设置本地目录';
             if (h && h.name) {
                 displayPath = h.name;
-            } else if (s.cacheImportPath) {
+            } else if (s.cacheImportPath && s.cacheImportPath !== defaultSettings.cacheImportPath) {
                 displayPath = s.cacheImportPath;
             }
 
@@ -3597,10 +3768,15 @@
 
         // 1. Choose Folder
         const chooseBtn = panel.querySelector('#indextts-choose-folder');
+        const chooseCacheFiles = () => pickAudioFiles(async files => {
+            await importCacheFiles(files);
+            await updateAudioPoolStats();
+        }, 'audio/*,.wav,.mp3,.ogg,.json');
+        panel.querySelector('#indextts-import-files').onclick = chooseCacheFiles;
         if (chooseBtn) {
             chooseBtn.onclick = async () => {
                 if (!window.showDirectoryPicker) {
-                    if (window.toastr) window.toastr.error('浏览器不支持 File System Access API');
+                    chooseCacheFiles();
                     return;
                 }
                 try {
@@ -3620,7 +3796,7 @@
                         if (window.toastr) window.toastr.success(`已选定目录: ${h.name}`);
                     }
                 } catch (e) {
-                    if (e.name !== 'AbortError') console.error(e);
+                    if (e.name !== 'AbortError') window.toastr?.warning('目录选择不可用，请点「导入文件」。');
                 }
             };
         }
@@ -3644,7 +3820,7 @@
             scanImportBtn.onclick = async () => {
                 const h = LocalRepo.getHandle();
                 if (!h) {
-                    if (window.toastr) window.toastr.warning('请先点击【📂 选择】设置本地音频目录');
+                    chooseCacheFiles();
                     return;
                 }
                 // Ensure permission
@@ -3666,7 +3842,8 @@
             exportBtn.onclick = async () => {
                 const h = LocalRepo.getHandle();
                 if (!h) {
-                    if (window.toastr) window.toastr.warning('请先点击【📂 选择】设置本地音频目录');
+                    try { await downloadCacheBackup(); }
+                    catch (error) { window.toastr?.error(`导出失败：${error.message}`); }
                     return;
                 }
                 // Ensure permission
@@ -3775,6 +3952,69 @@
 
     // 导出格式: [角色]_文本预览_hash.wav，哈希在末尾
     const IMPORT_FILENAME_REGEX = /^\[(.*?)\]_(.+)_([a-f0-9]{6,})\.(?:wav|mp3|ogg)$/i;
+    const backupFormat = 'indextts2-cache-v1';
+    const maxBackupBytes = 32 * 1024 * 1024;
+
+    async function saveCacheImport(record) {
+        if ((await AudioStorage.getAudio(record.hash))?.blob) return false;
+        await AudioStorage.saveAudio(record);
+        if (!(await AudioStorage.getAudio(record.hash))) throw new Error('缓存无法写入手机。');
+        return true;
+    }
+
+    async function cacheRecordFromFile(file) {
+        const match = file.name.match(IMPORT_FILENAME_REGEX);
+        const character = match?.[1]?.trim() || 'Imported';
+        const text = match?.[2]?.trim() || file.name.replace(/\.(wav|mp3|ogg)$/i, '');
+        const hash = match?.[3]?.toLowerCase() || await generateHash(character, 'imported', text, 1, 1);
+        return { hash, blob: file, character, text, voice: '', speed: 1, volume: 1, timestamp: Date.now() };
+    }
+
+    async function importCacheFiles(files) {
+        let imported = 0;
+        let skipped = 0;
+        for (const file of files) {
+            if (file.name.toLowerCase().endsWith('.json')) {
+                if (file.size > maxBackupBytes * 1.5) throw new Error('缓存备份文件过大。');
+                const backup = JSON.parse(await file.text());
+                if (backup?.format !== backupFormat || !Array.isArray(backup.records)) throw new Error('请选择本扩展导出的缓存备份。');
+                for (const record of backup.records) {
+                    if (typeof record?.audio !== 'string' || !/^(?:[a-f0-9]{6,64}|fallback_-?[a-f0-9]+)$/i.test(record?.hash ?? '')) {
+                        throw new Error('缓存备份包含无效记录。');
+                    }
+                    const { audio, type, ...fields } = record;
+                    const bytes = Uint8Array.from(atob(audio), c => c.charCodeAt(0));
+                    const mime = /^audio\/[\w.+-]+$/i.test(type ?? '') ? type : 'audio/wav';
+                    if (await saveCacheImport({ ...fields, blob: new Blob([bytes], { type: mime }) })) imported++;
+                    else skipped++;
+                }
+            } else if (/\.(wav|mp3|ogg)$/i.test(file.name)) {
+                if (await saveCacheImport(await cacheRecordFromFile(file))) imported++;
+                else skipped++;
+            }
+        }
+        window.toastr?.success(`缓存导入完成：新增 ${imported} 条，跳过 ${skipped} 条。`);
+    }
+
+    async function downloadCacheBackup() {
+        const records = (await AudioStorage.getAllAudios()).filter(record => record.blob instanceof Blob);
+        if (!records.length) { window.toastr?.info('暂无可备份的语音缓存。'); return; }
+        const size = records.reduce((total, record) => total + record.blob.size, 0);
+        if (size > maxBackupBytes) throw new Error('手机单次备份最多 32 MiB，更多缓存可用支持目录导出的浏览器备份。');
+        const encoded = [];
+        for (const { blob, hash, character, text, voice, speed, volume, timestamp } of records) {
+            encoded.push({ hash, character, text, voice, speed, volume, timestamp, type: blob.type, audio: await blobToBase64Pure(blob) });
+        }
+        const blob = new Blob([JSON.stringify({ format: backupFormat, records: encoded })], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `IndexTTS2-缓存-${new Date().toISOString().slice(0, 10)}.json`;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    }
 
     async function getAllAudioFilesFromDir(dirHandle, list = []) {
         try {
@@ -3811,36 +4051,8 @@
                 const f = fileHandles[i];
                 try {
                     const file = await f.getFile();
-                    const blob = file.slice(0, file.size, file.type || 'audio/wav');
-                    const name = f.name;
-                    const match = name.match(IMPORT_FILENAME_REGEX);
-                    let character, text, hash;
-                    if (match) {
-                        character = (match[1] || '').trim() || 'Imported';
-                        text = (match[2] || '').trim() || name;
-                        hash = (match[3] || '').toLowerCase();
-                    } else {
-                        character = 'Imported';
-                        text = name.replace(/\.(wav|mp3|ogg)$/i, '');
-                        hash = await generateHash(character, 'imported', text, 1, 1);
-                    }
-                    const existing = await AudioStorage.getAudio(hash);
-                    if (existing && existing.blob) {
-                        skipped++;
-                    } else {
-                        const record = {
-                            hash,
-                            blob,
-                            character,
-                            text,
-                            voice: '',
-                            speed: 1,
-                            volume: 1,
-                            timestamp: Date.now(),
-                        };
-                        await AudioStorage.saveAudio(record);
-                        imported++;
-                    }
+                    if (await saveCacheImport(await cacheRecordFromFile(file))) imported++;
+                    else skipped++;
                 } catch (e) {
                     console.warn('[IndexTTS2] import file error:', f.name, e);
                 }
@@ -4057,8 +4269,7 @@
             try {
                 const list = await AudioStorage.getAllAudios();
                 if (!list || list.length === 0) {
-                    console.log('[IndexTTS2] 缓存池为空，建议在设置中执行「扫描本地目录同步至缓存」以节省推理算力');
-                    if (window.toastr) window.toastr.info('缓存池为空，建议执行「扫描本地目录同步至缓存」以节省算力');
+                    console.log('[IndexTTS2] 语音将在首次朗读后自动缓存');
                 }
             } catch (e) { }
         }, 800);
