@@ -1,6 +1,6 @@
 {
   "name": "st-indextts2-mobile",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "private": true,
   "main": "indextts2-mobile-relay.mjs"
 }

@@ -1,6 +1,8 @@
 (function () {
     const extensionName = "st-indextts2";
     const extensionFolderPath = 'scripts/extensions/third-party/st-indextts2-mobile/';
+    const extensionVersion = '1.3.4';
+    const extensionId = 'third-party/st-indextts2-mobile';
     const mobileRelay = '/api/plugins/indextts2-mobile';
     const tavernVoiceEndpoint = '/api/openai/custom/generate-voice';
     const voiceBase = 'http://127.0.0.1:7880';
@@ -102,6 +104,33 @@
         return value.replace(/[&"<>]/g, character => ({ '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' })[character]);
     }
 
+    async function updateInstalledExtension() {
+        const headers = new Headers(getContext()?.getRequestHeaders?.());
+        headers.set('Content-Type', 'application/json');
+        const discovery = await fetch('/api/extensions/discover', { headers, cache: 'no-store' });
+        if (!discovery.ok) throw new Error(`无法读取已安装扩展（HTTP ${discovery.status}）。`);
+        const extensions = await discovery.json();
+        const installed = Array.isArray(extensions) && extensions.find(extension => extension?.name === extensionId);
+        if (!installed || !['local', 'global'].includes(installed.type)) {
+            throw new Error('酒馆未识别到当前扩展。请在「管理扩展」中查看安装来源。');
+        }
+        const response = await fetch('/api/extensions/update', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ extensionName: extensionId, global: installed.type === 'global' }),
+        });
+        const text = await response.text();
+        let result;
+        try { result = JSON.parse(text); } catch { result = null; }
+        if (!response.ok) {
+            const detail = [result?.error, result?.detail, result?.message].find(value => typeof value === 'string')
+                || (response.headers.get('content-type')?.includes('text/plain') ? text.trim() : '');
+            throw new Error(detail.slice(0, 200) || `酒馆更新接口返回 HTTP ${response.status}。`);
+        }
+        if (typeof result?.isUpToDate !== 'boolean') throw new Error('酒馆更新接口返回了未知结果。');
+        return result.isUpToDate;
+    }
+
     async function useMobileRelay(settings) {
         if (settings.mobileTransport === 'direct' || settings.mobileTransport === 'tavern') return false;
         if (settings.mobileTransport === 'relay') return true;
@@ -145,6 +174,9 @@
                 });
             } catch (error) {
                 const detail = error?.message || (typeof error === 'string' ? error : '无法调用语音接口。');
+                if (/Unsupported TTS route/.test(detail)) {
+                    throw new Error('当前 App 版本未实现此语音转发接口。请选「局域网直连」再测试。');
+                }
                 throw new Error(`TauriTavern 原生转发失败：${detail.slice(0, 180)}`);
             } finally {
                 if (abort) signal.removeEventListener('abort', abort);
@@ -3340,7 +3372,14 @@
                         <i class="inline-drawer-icon fa-solid fa-circle-chevron-down"></i>
                     </div>
                     <div class="inline-drawer-content" style="display:none;">
-                        
+                        <div class="indextts-setting-module">
+                            <div class="indextts-setting-row">
+                                <label for="indextts-update-extension">当前版本 ${extensionVersion}</label>
+                                <button type="button" class="menu_button" id="indextts-update-extension">更新扩展</button>
+                                <span id="indextts-update-status" role="status"></span>
+                            </div>
+                        </div>
+
                         <!-- 预设管理 -->
                         <div class="indextts-setting-module">
                             <div class="indextts-module-header">⚙️ 预设管理</div>
@@ -3552,6 +3591,31 @@
         bindInput('#indextts-clone-url', 'cloningUrl');
         bindInput('#indextts-voice-list-url', 'voiceListUrl');
         bindInput('#indextts-model', 'model');
+
+        panel.querySelector('#indextts-update-extension').onclick = async event => {
+            const button = event.currentTarget;
+            const status = panel.querySelector('#indextts-update-status');
+            if (button.dataset.readyToReload === 'true') {
+                location.reload();
+                return;
+            }
+            button.disabled = true;
+            status.textContent = '正在检查更新…';
+            try {
+                const isUpToDate = await updateInstalledExtension();
+                if (isUpToDate) {
+                    status.textContent = '仓库已是最新版本。';
+                } else {
+                    status.textContent = '更新已下载。保存正在编辑的内容后，重新加载酒馆。';
+                    button.textContent = '重新加载酒馆';
+                    button.dataset.readyToReload = 'true';
+                }
+            } catch (error) {
+                status.textContent = `更新失败：${error.message}`;
+            } finally {
+                button.disabled = false;
+            }
+        };
 
         panel.querySelector('#indextts-mobile-transport').onchange = event => {
             getSettings().mobileTransport = event.target.value;
