@@ -122,6 +122,73 @@
         });
     }
 
+    async function requestTavernVoice(body, signal) {
+        const invoke = window.__TAURITAVERN__?.invoke?.safeInvoke ?? window.__TAURI__?.core?.invoke;
+        if (typeof invoke === 'function') {
+            let abort;
+            try {
+                const request = invoke('tts_handle', { path: 'openai/custom/generate-voice', body });
+                const result = signal ? await Promise.race([request, new Promise((_, reject) => {
+                    abort = () => reject(signal.reason);
+                    if (signal.aborted) abort();
+                    else signal.addEventListener('abort', abort, { once: true });
+                })]) : await request;
+                const status = Number(result?.status);
+                if (!Number.isInteger(status) || status < 200 || status > 599
+                    || typeof (result?.bodyBase64 ?? result?.body_base64) !== 'string') {
+                    throw new Error('原生语音接口返回格式异常。');
+                }
+                const bytes = Uint8Array.from(atob(result.bodyBase64 ?? result.body_base64), byte => byte.charCodeAt(0));
+                return new Response([204, 205, 304].includes(status) ? null : bytes, {
+                    status,
+                    headers: { 'Content-Type': result.contentType ?? result.content_type ?? 'application/octet-stream' },
+                });
+            } catch (error) {
+                const detail = error?.message || (typeof error === 'string' ? error : '无法调用语音接口。');
+                throw new Error(`TauriTavern 原生转发失败：${detail.slice(0, 180)}`);
+            } finally {
+                if (abort) signal.removeEventListener('abort', abort);
+            }
+        }
+
+        const headers = new Headers(getContext()?.getRequestHeaders?.());
+        headers.set('Content-Type', 'application/json');
+        if (!headers.has('X-CSRF-Token')) {
+            const csrf = await fetch('/csrf-token', { signal });
+            if (csrf.ok && csrf.headers.get('content-type')?.includes('application/json')) {
+                const { token } = await csrf.json();
+                if (typeof token === 'string') headers.set('X-CSRF-Token', token);
+            }
+        }
+        return fetch(tavernVoiceEndpoint, { method: 'POST', headers, signal, body: JSON.stringify(body) });
+    }
+
+    async function readTavernMetadata(response) {
+        const bytes = await response.arrayBuffer();
+        const decoder = new TextDecoder();
+        const view = new DataView(bytes);
+        const tag = offset => view.getUint32(offset, false);
+        if (bytes.byteLength >= 12 && tag(0) === 0x52494646 && tag(8) === 0x57415645) {
+            const end = Math.min(bytes.byteLength, 8 + view.getUint32(4, true));
+            for (let offset = 12; offset + 8 <= end;) {
+                const size = view.getUint32(offset + 4, true);
+                const start = offset + 8;
+                if (start + size > end) break;
+                if (tag(offset) === 0x6974326d) {
+                    const jsonText = decoder.decode(new Uint8Array(bytes, start, size));
+                    return new Response(jsonText, { headers: { 'Content-Type': 'application/json' } });
+                }
+                offset = start + size + (size % 2);
+            }
+            throw new Error('语音服务返回的 WAV 缺少音色数据。');
+        }
+
+        const text = decoder.decode(bytes);
+        if (/^\s*[{\[]/.test(text)) return new Response(text, { headers: { 'Content-Type': 'application/json' } });
+        const kind = response.headers.get('content-type')?.split(';')[0] || '未知格式';
+        throw new Error(`酒馆返回了 ${kind}（HTTP ${response.status}），没有转发到电脑的语音接口。`);
+    }
+
     async function tavernPost(settings, operation, input, signal) {
         const configured = new URL(directEndpoint(settings.apiUrl, '/api/v1/tts/tasks'));
         const lan = /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)\d+(?:\.\d+){1,2}$/;
@@ -129,31 +196,22 @@
             || configured.username || configured.password || configured.pathname !== '/api/v1/tts/tasks') {
             throw new Error('酒馆内置转发需要电脑的局域网 TTS 服务地址。');
         }
-        const headers = new Headers(getContext()?.getRequestHeaders?.());
-        headers.set('Content-Type', 'application/json');
-        if (!headers.has('X-CSRF-Token')) {
-            const csrf = await fetch('/csrf-token', { signal });
-            if (csrf.ok) {
-                const { token } = await csrf.json();
-                if (typeof token === 'string') headers.set('X-CSRF-Token', token);
-            }
-        }
-        return fetch(tavernVoiceEndpoint, {
-            method: 'POST', headers, signal,
-            body: JSON.stringify({
-                provider_endpoint: `${configured.origin}/api/v1/sillytavern/${operation}`,
-                input: operation === 'voices' ? 'voices' : JSON.stringify(input),
-                response_format: 'mp3',
-                model: 'index-tts2',
-            }),
-        });
+        const response = await requestTavernVoice({
+            provider_endpoint: `${configured.origin}/api/v1/sillytavern/${operation}`,
+            input: operation === 'voices' ? 'voices' : JSON.stringify(input),
+            response_format: operation === 'speech' ? 'mp3' : 'wav',
+            model: 'index-tts2',
+        }, signal);
+        return response.ok && operation !== 'speech' ? readTavernMetadata(response) : response;
     }
 
     async function readVoiceList(response, transport) {
+        const text = await response.text();
         let data;
-        try { data = await response.json(); } catch { data = null; }
+        try { data = JSON.parse(text); } catch { data = null; }
         if (!response.ok) {
-            const detail = typeof data?.detail === 'string' ? data.detail : '';
+            const detail = [data?.detail, data?.message, data?.error].find(value => typeof value === 'string')
+                || (transport === 'tavern' && response.headers.get('content-type')?.includes('text/plain') ? text.trim().slice(0, 180) : '');
             const unavailable = transport === 'tavern' ? '此酒馆没有开放内置语音转发接口。' : '手机端中继尚未安装或启用。';
             throw new Error(detail || (response.status === 404 && transport !== 'direct' ? unavailable : `HTTP ${response.status}`));
         }
