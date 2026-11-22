@@ -1,9 +1,9 @@
 {
     "name": "st-indextts2",
     "display_name": "IndexTTS2 Player · 移动适配版",
-    "description": "支持手机本机语音中继、离线音色清单和文件导入。",
+    "description": "支持酒馆内置语音转发、正则显示和背景音文件导入。",
     "author": "kirara",
-    "version": "1.3.1",
+    "version": "1.3.2",
     "loading_order": 101,
     "js": "index.js",
     "css": "style.css"

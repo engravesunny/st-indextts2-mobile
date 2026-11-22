@@ -2,6 +2,7 @@
     const extensionName = "st-indextts2";
     const extensionFolderPath = 'scripts/extensions/third-party/st-indextts2-mobile/';
     const mobileRelay = '/api/plugins/indextts2-mobile';
+    const tavernVoiceEndpoint = '/api/openai/custom/generate-voice';
     const voiceBase = 'http://127.0.0.1:7880';
     const installedVoiceNames = [
         'default', 'gentle_N10', '七柒', '千雪', '古风少女', '夹子', '妇女', '娇妻', '学姐', '少御',
@@ -74,6 +75,15 @@
         return saved;
     }
 
+    function savedVoiceBase(settings) {
+        try {
+            const endpoint = new URL(settings.apiUrl);
+            const suffix = '/api/v1/tts/tasks';
+            if (endpoint.hostname === '127.0.0.1' || !endpoint.pathname.endsWith(suffix)) return '';
+            return endpoint.origin + endpoint.pathname.slice(0, -suffix.length);
+        } catch { return ''; }
+    }
+
     function directFetch(url, options = {}) {
         const address = new URL(url, location.href);
         const privateIPv4 = /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)\d+(?:\.\d+){1,2}$/;
@@ -93,7 +103,7 @@
     }
 
     async function useMobileRelay(settings) {
-        if (settings.mobileTransport === 'direct') return false;
+        if (settings.mobileTransport === 'direct' || settings.mobileTransport === 'tavern') return false;
         if (settings.mobileTransport === 'relay') return true;
         if (Date.now() >= relayProbeExpires) {
             relayProbeExpires = Date.now() + 5000;
@@ -112,21 +122,65 @@
         });
     }
 
+    async function tavernPost(settings, operation, input, signal) {
+        const configured = new URL(directEndpoint(settings.apiUrl, '/api/v1/tts/tasks'));
+        const lan = /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)\d+(?:\.\d+){1,2}$/;
+        if (!['http:', 'https:'].includes(configured.protocol) || !lan.test(configured.hostname)
+            || configured.username || configured.password || configured.pathname !== '/api/v1/tts/tasks') {
+            throw new Error('酒馆内置转发需要电脑的局域网 TTS 服务地址。');
+        }
+        const headers = new Headers(getContext()?.getRequestHeaders?.());
+        headers.set('Content-Type', 'application/json');
+        if (!headers.has('X-CSRF-Token')) {
+            const csrf = await fetch('/csrf-token', { signal });
+            if (csrf.ok) {
+                const { token } = await csrf.json();
+                if (typeof token === 'string') headers.set('X-CSRF-Token', token);
+            }
+        }
+        return fetch(tavernVoiceEndpoint, {
+            method: 'POST', headers, signal,
+            body: JSON.stringify({
+                provider_endpoint: `${configured.origin}/api/v1/sillytavern/${operation}`,
+                input: operation === 'voices' ? 'voices' : JSON.stringify(input),
+                response_format: 'mp3',
+                model: 'index-tts2',
+            }),
+        });
+    }
+
+    async function readVoiceList(response, transport) {
+        let data;
+        try { data = await response.json(); } catch { data = null; }
+        if (!response.ok) {
+            const detail = typeof data?.detail === 'string' ? data.detail : '';
+            const unavailable = transport === 'tavern' ? '此酒馆没有开放内置语音转发接口。' : '手机端中继尚未安装或启用。';
+            throw new Error(detail || (response.status === 404 && transport !== 'direct' ? unavailable : `HTTP ${response.status}`));
+        }
+        const entries = Array.isArray(data) ? data : data?.voices;
+        if (!Array.isArray(entries)) throw new Error('音频列表地址未返回音色清单。');
+        const names = entries.map(v => typeof v === 'string' ? v : v?.filename || v?.name)
+            .filter(name => typeof name === 'string' && name.trim());
+        return { names: [...new Set(names)], relay: transport === 'relay', transport };
+    }
+
+    function transportLabel(transport) {
+        if (transport === 'tavern') return '酒馆内置转发';
+        if (transport === 'relay') return '手机中继';
+        return '局域网直连';
+    }
+
     async function loadVoiceNames(settings) {
+        if (settings.mobileTransport === 'tavern') {
+            return readVoiceList(await tavernPost(settings, 'voices', null, timeoutSignal(6500)), 'tavern');
+        }
         const relay = await useMobileRelay(settings);
         const url = directEndpoint(settings.voiceListUrl, '/api/v1/voices');
         const signal = timeoutSignal(6500);
         const res = relay
             ? await fetch(`${mobileRelay}/voices`, { signal, cache: 'no-store' })
             : await directFetch(url, { signal, cache: 'no-store' });
-        const type = res.headers.get('content-type') ?? '';
-        const data = type.includes('application/json') ? await res.json() : null;
-        if (!res.ok) throw new Error(data?.detail || (res.status === 404 && relay ? '手机端中继尚未安装或启用。' : `HTTP ${res.status}`));
-        const entries = Array.isArray(data) ? data : data?.voices;
-        if (!Array.isArray(entries)) throw new Error('音频列表地址未返回音色清单。');
-        const names = entries.map(v => typeof v === 'string' ? v : v?.filename || v?.name)
-            .filter(name => typeof name === 'string' && name.trim());
-        return { names: [...new Set(names)], relay };
+        return readVoiceList(res, relay ? 'relay' : 'direct');
     }
 
     function pickAudioFiles(onFiles, accept) {
@@ -421,6 +475,15 @@
         const list = Array.from(document.querySelectorAll('.mes'));
         const idx = list.indexOf(msg);
         return idx >= 0 ? String(idx) : null;
+    }
+
+    function parseMessageDialogues(msg, visibleText) {
+        const id = msg?.getAttribute('mesid') ?? msg?.dataset?.mesid ?? msg?.getAttribute('data-mesid');
+        const source = typeof id === 'string' && /^\d+$/.test(id) ? getContext()?.chat?.[Number(id)]?.mes : null;
+        const parse = text => (typeof text === 'string' ? text : '').split(/\r\n|\r|\n/)
+            .map(parseVNLine).filter(line => line && !line.isAction);
+        const original = parse(source);
+        return original.length ? original : parse(visibleText);
     }
 
     function utf8ToBase64(str) {
@@ -1053,6 +1116,12 @@
                 }
             }
 
+            const displayLine = /^([^\[\]<>:：]{1,60})[:：]\s*(“(.+)”|「(.+)」)\s*$/.exec(trimmed);
+            if (displayLine) {
+                const dialogue = (displayLine[3] ?? displayLine[4]).trim();
+                if (dialogue) return { character: displayLine[1].trim(), dialogue, rawContent: displayLine[2],
+                    isAction: false, isQuoted: true, emotion: null };
+            }
             return null;
         } catch (e) {
             console.error('[IndexTTS2] parseVNLine error:', e);
@@ -1065,8 +1134,7 @@
         const characters = new Set();
         // 1. History
         document.querySelectorAll('.mes[is_user="false"] .mes_text').forEach(mesText => {
-            (mesText.innerText || '').split('\n').forEach(line => {
-                const parsed = parseVNLine(line.trim());
+            parseMessageDialogues(mesText.closest('.mes'), mesText.innerText).forEach(parsed => {
                 if (parsed?.character && !['旁白', 'Narrator'].includes(parsed.character)) {
                     characters.add(parsed.character);
                 }
@@ -1151,13 +1219,14 @@
         });
 
         try {
-            const route = await useMobileRelay(settings);
-            const res = route ? await relayPost('/speech', payload)
-                : await directFetch(directEndpoint(settings.apiUrl, '/api/v1/tts/tasks'), {
+            let res;
+            if (settings.mobileTransport === 'tavern') res = await tavernPost(settings, 'speech', payload);
+            else if (await useMobileRelay(settings)) res = await relayPost('/speech', payload);
+            else res = await directFetch(directEndpoint(settings.apiUrl, '/api/v1/tts/tasks'), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload),
-                });
+            });
 
             if (!res.ok) {
                 const errText = await res.text().catch(() => '');
@@ -1326,9 +1395,10 @@
         try {
             const uploadFileName = originalFileName || (characterName + '.wav');
             if (base64Audio.length > 20 * 1024 * 1024) throw new Error('参考音频太大，请截取一小段后再上传。');
-            const route = await useMobileRelay(settings);
             let res;
-            if (route) {
+            if (settings.mobileTransport === 'tavern') {
+                res = await tavernPost(settings, 'upload', { filename: uploadFileName, audio: base64Audio });
+            } else if (await useMobileRelay(settings)) {
                 res = await relayPost('/upload', { filename: uploadFileName, audio: base64Audio });
             } else {
                 const bytes = Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0));
@@ -1625,10 +1695,10 @@
             }
 
             state.textContent = '正在读取音色列表…';
-            loadVoiceNames(settings).then(({ names, relay }) => {
+            loadVoiceNames(settings).then(({ names, transport }) => {
                 if (!selects[0]?.isConnected) return;
                 fillChoices(names);
-                state.textContent = `${relay ? '手机中继' : '局域网直连'} · ${names.length} 条音色`;
+                state.textContent = `${transportLabel(transport)} · ${names.length} 条音色`;
                 AudioStorage.saveConfig(catalogKey, names).catch(() => {});
             }).catch(async error => {
                 const saved = await AudioStorage.getConfig(catalogKey).catch(() => null);
@@ -1712,27 +1782,8 @@
 
         const voiceMap = getVoiceMap();
 
-        // Get text content and split by lines
-        const textContent = mesText.innerText || '';
-        const lines = textContent.split('\n');
-
-        // Find all VN-format lines and their positions
-        const vnLines = [];
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-
-            const parsed = parseVNLine(trimmed);
-            if (parsed) {
-                vnLines.push({
-                    original: trimmed,
-                    parsed: parsed,
-                    // Remove fallback to defaultVoice to detect unset state
-                    voice: voiceMap[parsed.character],
-                    scene: parsed.scene || null
-                });
-            }
-        }
+        const vnLines = parseMessageDialogues(msg, mesText.innerText)
+            .map(parsed => ({ parsed, voice: voiceMap[parsed.character] }));
 
         if (vnLines.length === 0) {
             mesText.dataset.indexttsInjected = 'true';
@@ -1750,7 +1801,8 @@
             const emotionEnc = vn.parsed.emotion || '';
 
             // 仅在原 HTML 中查找「带引号的对话」部分（第二组）
-            const dialogueContent = vn.parsed.rawContent;
+            const rawContent = vn.parsed.rawContent;
+            const dialogueContent = html.includes(rawContent) ? rawContent : `“${vn.parsed.dialogue}”`;
             if (!dialogueContent) continue;
 
             // Escape special regex characters
@@ -1861,25 +1913,14 @@
             return result;
         }
 
-        // GAL 模式：解析 VN 格式，未配置配音也纳入结果并打日志
-        for (const line of textContent.split('\n')) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            const parsed = parseVNLine(trimmed);
-            if (parsed && !parsed.isAction) {
-                const voice = voiceMap[parsed.character];
-                if (voice === undefined || voice === null || voice === '') {
-                    console.warn('[IndexTTS2] 角色未配置配音，将跳过推理:', parsed.character);
-                }
-                result.push({
-                    text: parsed.dialogue,
-                    character: parsed.character,
-                    scene: parsed.scene || null,
-                    voice: voice !== undefined && voice !== null && voice !== '' ? voice : undefined,
-                    emotion: parsed.emotion || null,
-                });
-                console.log('[IndexTTS2][Ambient] collectVNLines push: character=' + parsed.character + ' scene=' + (parsed.scene || 'null'));
-            }
+        for (const parsed of parseMessageDialogues(msg, textContent)) {
+            result.push({
+                text: parsed.dialogue,
+                character: parsed.character,
+                scene: parsed.scene || null,
+                voice: voiceMap[parsed.character] || undefined,
+                emotion: parsed.emotion || null,
+            });
         }
         return result;
     }
@@ -3264,6 +3305,7 @@
                                 <label for="indextts-mobile-transport">连接方式</label>
                                 <select id="indextts-mobile-transport" class="text_pole">
                                     <option value="auto" ${settings.mobileTransport === 'auto' ? 'selected' : ''}>自动选择</option>
+                                    <option value="tavern" ${settings.mobileTransport === 'tavern' ? 'selected' : ''}>酒馆内置转发</option>
                                     <option value="relay" ${settings.mobileTransport === 'relay' ? 'selected' : ''}>手机本机中继</option>
                                     <option value="direct" ${settings.mobileTransport === 'direct' ? 'selected' : ''}>局域网直连</option>
                                 </select>
@@ -3274,7 +3316,7 @@
                             </div>
                             <div class="indextts-setting-row">
                                 <label for="indextts-base-url">电脑语音服务地址</label>
-                                <input type="url" id="indextts-base-url" placeholder="http://电脑局域网IP:7880" class="text_pole">
+                                <input type="url" id="indextts-base-url" value="${fieldValue(savedVoiceBase(settings))}" placeholder="http://电脑局域网IP:7880" class="text_pole">
                                 <button type="button" class="menu_button" id="indextts-apply-base">应用到三个接口</button>
                             </div>
                             <div class="indextts-setting-row">
@@ -3466,8 +3508,8 @@
             status.textContent = '测试中…';
             try {
                 relayProbeExpires = 0;
-                const { names, relay } = await loadVoiceNames(getSettings());
-                status.textContent = `${relay ? '手机中继' : '局域网直连'}成功 · ${names.length} 条音色`;
+                const { names, transport } = await loadVoiceNames(getSettings());
+                status.textContent = `${transportLabel(transport)}成功 · ${names.length} 条音色`;
             } catch (error) { status.textContent = `连接失败：${error.message}`; }
             finally { button.disabled = false; }
         };
@@ -3476,7 +3518,9 @@
             const field = panel.querySelector('#indextts-base-url');
             const status = panel.querySelector('#indextts-mobile-status');
             try {
-                const base = new URL(field.value.trim());
+                const value = field.value.trim();
+                if (!value) throw new Error('请填写电脑语音服务地址，已填写下方接口时可以直接测试。');
+                const base = new URL(value);
                 if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash) {
                     throw new Error('请填入 HTTP 或 HTTPS 服务地址。');
                 }
