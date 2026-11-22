@@ -88,6 +88,9 @@ export async function init(router) {
 
   router.get('/status', (_req, res) => res.json({ bridge: info.id }));
   router.get('/voices', (_req, res) => relay(target, res, '/api/v1/voices'));
+  router.get('/voice-preview/:name', (req, res) => relay(target, res, '/preview/' + encodeURIComponent(req.params.name)));
+  router.get('/scenes', (_req, res) => relay(target, res, '/api/v1/scenes'));
+  router.get('/scene-preview/:name', (req, res) => relay(target, res, '/api/v1/scenes/' + encodeURIComponent(req.params.name)));
 
   router.post('/speech', (req, res) => {
     if (!req.is('application/json') || typeof req.body?.text !== 'string' || req.body.text.length > 4096) {

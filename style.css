@@ -789,8 +789,20 @@
 .indextts-char-audio {
     flex: 1;
     display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
     gap: 8px;
     align-items: center;
+}
+
+.indextts-char-audio .indextts-voice-select {
+    flex: 1 1 120px;
+    min-width: 0;
+}
+
+.indextts-char-audio .indextts-reference-preview {
+    flex: 0 0 auto;
+    white-space: nowrap;
 }
 
 /* ============================================================

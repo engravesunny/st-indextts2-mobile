@@ -1,17 +1,21 @@
 (function () {
     const extensionName = "st-indextts2";
     const extensionFolderPath = 'scripts/extensions/third-party/st-indextts2-mobile/';
-    const extensionVersion = '1.3.4';
+    const extensionVersion = '1.3.7';
     const extensionId = 'third-party/st-indextts2-mobile';
     const mobileRelay = '/api/plugins/indextts2-mobile';
     const tavernVoiceEndpoint = '/api/openai/custom/generate-voice';
     const voiceBase = 'http://127.0.0.1:7880';
-    const installedVoiceNames = [
-        'default', 'gentle_N10', '七柒', '千雪', '古风少女', '夹子', '妇女', '娇妻', '学姐', '少御',
-        '御妈', '御姐', '性感', '温御', '男_青年音', '男_玄幻小说旁白', '病娇', '老师', '老奶奶',
-        '萝莉', '软妹', '示例-扩展测试音色', '示例-JP音色中文', '示例-JP音色日文', '示例-JP音色英文',
-        'nsfw_娇妻', 'nsfw_少御', 'nsfw_母系小烟', 'nsfw_母系小瑶', 'nsfw_老师',
-    ].map(name => `${name}.wav`);
+    const bundledVoiceGroups = [
+        ['明亮女声', ['晴铃', '星澄', '琉音', '夏芽', '夹子', '病娇', '萝莉']],
+        ['轻柔女声', ['云舒', '春絮', '柔羽', '软妹', '温御', 'gentle_N10']],
+        ['自然女声', ['清禾', '白露', '林溪', '七柒', '千雪', '古风少女', '学姐', '娇妻', '少御']],
+        ['低音女声', ['墨岚', '晚竹', '御妈', '御姐', '老师', '老奶奶']],
+        ['其他女声', ['妇女', '性感', 'nsfw_娇妻', 'nsfw_少御', 'nsfw_母系小烟', 'nsfw_母系小瑶', 'nsfw_老师']],
+        ['备用男声', ['男_青年音']],
+        ['默认与示例', ['default', '示例-扩展测试音色', '示例-JP音色中文', '示例-JP音色日文', '示例-JP音色英文']],
+    ];
+    const installedVoiceNames = bundledVoiceGroups.flatMap(([, names]) => names.map(name => `${name}.wav`));
     let relayProbe;
     let relayProbeExpires = 0;
 
@@ -39,6 +43,7 @@
         // VN format: [角色|表情]|「对话」 or [旁白]|描述
         vnRegex: '^\\[([^\\]|]+)(?:\\|[^\\]]*)?\\]\\|(.+)$',
         voiceMap: {}, // { cardId: { characterName: "voice.wav" } }
+        hiddenSpeakers: {},
         promptInjection: {
             enabled: false,
             content: `描写任何角色（主要角色、NPC、路人）说话时，必须严格遵守格式，对话单开一行：
@@ -127,12 +132,14 @@
                 || (response.headers.get('content-type')?.includes('text/plain') ? text.trim() : '');
             throw new Error(detail.slice(0, 200) || `酒馆更新接口返回 HTTP ${response.status}。`);
         }
-        if (typeof result?.isUpToDate !== 'boolean') throw new Error('酒馆更新接口返回了未知结果。');
+        if (typeof result?.isUpToDate !== 'boolean' || !/^[0-9a-f]{7,40}$/i.test(result.shortCommitHash ?? '')) {
+            throw new Error('这个酒馆没有返回有效的更新提交，无法确认扩展已更新。');
+        }
         return result.isUpToDate;
     }
 
     async function useMobileRelay(settings) {
-        if (settings.mobileTransport === 'direct' || settings.mobileTransport === 'tavern') return false;
+        if (settings.mobileTransport === 'direct' || settings.mobileTransport === 'tavern' || useAudioWorkflow(settings)) return false;
         if (settings.mobileTransport === 'relay') return true;
         if (Date.now() >= relayProbeExpires) {
             relayProbeExpires = Date.now() + 5000;
@@ -175,7 +182,7 @@
             } catch (error) {
                 const detail = error?.message || (typeof error === 'string' ? error : '无法调用语音接口。');
                 if (/Unsupported TTS route/.test(detail)) {
-                    throw new Error('当前 App 版本未实现此语音转发接口。请选「局域网直连」再测试。');
+                    throw new Error('当前 App 版本未实现此语音转发接口。请选「TauriTavern 局域网连接」。');
                 }
                 throw new Error(`TauriTavern 原生转发失败：${detail.slice(0, 180)}`);
             } finally {
@@ -234,7 +241,151 @@
             response_format: operation === 'speech' ? 'mp3' : 'wav',
             model: 'index-tts2',
         }, signal);
-        return response.ok && operation !== 'speech' ? readTavernMetadata(response) : response;
+        return response.ok && ['voices', 'upload', 'scenes'].includes(operation) ? readTavernMetadata(response) : response;
+    }
+
+    function useAudioWorkflow(settings) {
+        return settings.mobileTransport === 'workflow' || (
+            settings.mobileTransport === 'auto' && location.hostname === 'tauri.localhost'
+            && Boolean(window.__TAURI__?.core?.invoke || window.__TAURITAVERN__?.invoke?.safeInvoke)
+        );
+    }
+
+    async function audioWorkflowPost(settings, operation, payload) {
+        const configured = new URL(directEndpoint(settings.apiUrl, '/api/v1/tts/tasks'));
+        const lan = /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)\d+(?:\.\d+){1,2}$/;
+        if (!['http:', 'https:'].includes(configured.protocol) || !lan.test(configured.hostname)
+            || configured.username || configured.password || configured.pathname !== '/api/v1/tts/tasks') {
+            throw new Error('音频工作流需要电脑的局域网 TTS 服务地址。');
+        }
+        const invoke = window.__TAURITAVERN__?.invoke?.safeInvoke ?? window.__TAURI__?.core?.invoke;
+        if (typeof invoke !== 'function') throw new Error('此客户端没有开放本地工作流接口。');
+        const requestId = 'it2-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+        let reply;
+        try {
+            reply = await invoke('sd_handle', {
+                requestId,
+                path: 'comfy/generate',
+                body: {
+                    url: configured.origin + '/api/v1/audio-workflow',
+                    prompt: JSON.stringify({ prompt: { '1': { class_type: 'IndexTTS2AudioPreview', inputs: { operation, payload } } } }),
+                },
+            });
+        } catch (error) {
+            throw new Error('本地音频工作流连接失败：' + String(error?.message || error).slice(0, 180));
+        }
+        const format = reply?.body?.format;
+        if (reply?.status !== 200 || typeof reply?.body?.data !== 'string'
+            || (format !== 'wav' && !(operation === 'scene' && format === 'mp3'))) {
+            throw new Error('本地工作流没有返回 IndexTTS2 音频。');
+        }
+        const bytes = Uint8Array.from(atob(reply.body.data), byte => byte.charCodeAt(0));
+        const response = new Response(bytes, { headers: { 'Content-Type': format === 'mp3' ? 'audio/mpeg' : 'audio/wav' } });
+        return ['voices', 'upload', 'scenes'].includes(operation) ? readTavernMetadata(response) : response;
+    }
+
+    async function previewRequest(settings, operation, name) {
+        let response;
+        if (useAudioWorkflow(settings)) response = await audioWorkflowPost(settings, operation, { name });
+        else if (settings.mobileTransport === 'tavern') response = await tavernPost(settings, operation, { name });
+        else {
+            const suffix = encodeURIComponent(name || '');
+            const relay = await useMobileRelay(settings);
+            const paths = relay
+                ? { scenes: '/scenes', scene: '/scene-preview/' + suffix, voice_preview: '/voice-preview/' + suffix }
+                : { scenes: '/api/v1/scenes', scene: '/api/v1/scenes/' + suffix, voice_preview: '/preview/' + suffix };
+            if (relay) response = await fetch(mobileRelay + paths[operation]);
+            else {
+                const address = new URL(directEndpoint(settings.voiceListUrl, '/api/v1/voices'));
+                address.pathname = address.pathname.replace(/\/api\/v1\/voices\/?$/, '') + paths[operation];
+                address.search = '';
+                address.hash = '';
+                response = await directFetch(address.href);
+            }
+        }
+        if (!response.ok) throw new Error(`读取试听音频失败（HTTP ${response.status}）。`);
+        return response;
+    }
+
+    async function voicePreviewUrl(name) {
+        return URL.createObjectURL(await (await previewRequest(getSettings(), 'voice_preview', name)).blob());
+    }
+
+    function groupedVoiceChoices(names) {
+        const remaining = new Set(names);
+        const choices = [];
+        function addGroup(label, filenames) {
+            if (!filenames.length) return;
+            const group = document.createElement('optgroup');
+            group.label = label;
+            group.append(...filenames.map(name => new Option(name.replace(/\.wav$/i, ''), name)));
+            choices.push(group);
+        }
+        for (const [label, voices] of bundledVoiceGroups) {
+            addGroup(label, voices.map(name => `${name}.wav`).filter(name => remaining.delete(name)));
+        }
+        addGroup('其他音色', [...remaining]);
+        return choices;
+    }
+
+    let previewSession = null;
+
+    function stopPreview() {
+        const session = previewSession;
+        if (!session) return;
+        previewSession = null;
+        session.button.textContent = '试听';
+        session.audio?.pause();
+        if (session.url) URL.revokeObjectURL(session.url);
+    }
+
+    async function togglePreview(button, loadUrl) {
+        if (previewSession?.button === button && previewSession.needsGesture) {
+            const session = previewSession;
+            try {
+                await session.audio.play();
+                if (previewSession === session) {
+                    session.needsGesture = false;
+                    button.textContent = '停止';
+                }
+            } catch (error) {
+                if (previewSession !== session) return;
+                stopPreview();
+                window.toastr?.error(error.message);
+            }
+            return;
+        }
+        const same = previewSession?.button === button;
+        stopPreview();
+        if (same) return;
+        const session = { button };
+        previewSession = session;
+        button.textContent = '取消';
+        try {
+            const url = await loadUrl();
+            if (!url) throw new Error('没有找到对应的试听音频。');
+            if (previewSession !== session || !button.isConnected) {
+                URL.revokeObjectURL(url);
+                if (previewSession === session) stopPreview();
+                return;
+            }
+            session.url = url;
+            const audio = new Audio(url);
+            session.audio = audio;
+            audio.onended = audio.onerror = () => { if (previewSession === session) stopPreview(); };
+            await audio.play();
+            if (previewSession === session) button.textContent = '停止';
+        } catch (error) {
+            if (previewSession !== session) return;
+            if (error.name === 'NotAllowedError') {
+                session.needsGesture = true;
+                button.textContent = '播放';
+                window.toastr?.warning('请再点击一次试听，让客户端允许播放。');
+            } else {
+                stopPreview();
+                window.toastr?.error(error.message);
+            }
+        }
     }
 
     async function readVoiceList(response, transport) {
@@ -255,12 +406,16 @@
     }
 
     function transportLabel(transport) {
+        if (transport === 'workflow') return 'TauriTavern 局域网连接';
         if (transport === 'tavern') return '酒馆内置转发';
         if (transport === 'relay') return '手机中继';
         return '局域网直连';
     }
 
     async function loadVoiceNames(settings) {
+        if (useAudioWorkflow(settings)) {
+            return readVoiceList(await audioWorkflowPost(settings, 'voices', null), 'workflow');
+        }
         if (settings.mobileTransport === 'tavern') {
             return readVoiceList(await tavernPost(settings, 'voices', null, timeoutSignal(6500)), 'tavern');
         }
@@ -570,10 +725,15 @@
     function parseMessageDialogues(msg, visibleText) {
         const id = msg?.getAttribute('mesid') ?? msg?.dataset?.mesid ?? msg?.getAttribute('data-mesid');
         const source = typeof id === 'string' && /^\d+$/.test(id) ? getContext()?.chat?.[Number(id)]?.mes : null;
-        const parse = text => (typeof text === 'string' ? text : '').split(/\r\n|\r|\n/)
+        const withoutMetadata = text => (typeof text === 'string' ? text : '')
+            .replace(/<(summary|analysis|thinking|system)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi, '')
+            .replace(/```[\s\S]*?(?:```|$)/g, '');
+        const parse = text => text.split(/\r\n|\r|\n/)
             .map(parseVNLine).filter(line => line && !line.isAction);
-        const original = parse(source);
-        return original.length ? original : parse(visibleText);
+        const cleaned = withoutMetadata(source);
+        const original = parse(cleaned);
+        return original.length || (typeof source === 'string' && cleaned !== source)
+            ? original : parse(withoutMetadata(visibleText));
     }
 
     function utf8ToBase64(str) {
@@ -778,6 +938,9 @@
         let currentScene = null;    // currently playing scene name
         let currentAudio = null;    // HTMLAudioElement
         let fadeTimer = null;       // rAF handle for fade
+        let fadingAudio = null;
+        let requestNumber = 0;
+        const sceneFiles = new Map();
         function _getFadeDuration() {
             return parseInt(getSettings().ambientFadeDuration ?? 0) || 0;
         }
@@ -819,28 +982,36 @@
             return Math.max(0, Math.min(1, parseFloat(s.ambientSoundVolume ?? 0.4)));
         }
 
+        function releaseAudio(audio) {
+            const url = audio.src;
+            audio.pause();
+            audio.removeAttribute('src');
+            if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+        }
+
         function _cancelFade() {
             if (fadeTimer !== null) { cancelAnimationFrame(fadeTimer); fadeTimer = null; }
+            if (fadingAudio) { releaseAudio(fadingAudio); fadingAudio = null; }
         }
 
         function _fadeOut(audioEl, onDone) {
             _cancelFade();
             const fadeDur = _getFadeDuration();
             if (!fadeDur) {
-                audioEl.pause();
-                audioEl.src = '';
+                releaseAudio(audioEl);
                 if (onDone) onDone();
                 return;
             }
             const start = performance.now();
             const startVol = audioEl.volume;
+            fadingAudio = audioEl;
             function step(now) {
                 const t = Math.min(1, (now - start) / fadeDur);
                 audioEl.volume = startVol * (1 - t);
                 if (t < 1) { fadeTimer = requestAnimationFrame(step); }
                 else {
-                    audioEl.pause();
-                    audioEl.src = '';
+                    releaseAudio(audioEl);
+                    fadingAudio = null;
                     fadeTimer = null;
                     if (onDone) onDone();
                 }
@@ -867,13 +1038,39 @@
             fadeTimer = requestAnimationFrame(step);
         }
 
+        function loadRemoteScene(sceneName) {
+            const settings = getSettings();
+            const key = settings.apiUrl + '|' + sceneName;
+            if (!sceneFiles.has(key)) {
+                if (sceneFiles.size >= 4) sceneFiles.delete(sceneFiles.keys().next().value);
+                const pending = previewRequest(settings, 'scene', sceneName)
+                    .then(response => response.blob()).catch(() => {
+                        if (sceneFiles.get(key) === pending) sceneFiles.delete(key);
+                        return null;
+                    });
+                sceneFiles.set(key, pending);
+            }
+            return sceneFiles.get(key);
+        }
+
+        async function prepareScene(sceneName) {
+            if (typeof sceneName !== 'string' || !sceneName || dirHandle || !useAudioWorkflow(getSettings())) return;
+            const name = sceneName.trim().normalize('NFC');
+            const local = await AudioStorage.getConfig(`mobileScene:${name}`).catch(() => null);
+            if (!(local instanceof Blob && local.size > 0)) await loadRemoteScene(name);
+        }
+
         async function _loadScene(sceneName) {
             let local;
             try { local = await AudioStorage.getConfig(`mobileScene:${sceneName.trim().normalize('NFC')}`); }
             catch (error) { console.warn('[IndexTTS2] 读取手机背景音失败', error); }
             if (local instanceof Blob && local.size > 0) return URL.createObjectURL(local);
             console.log('[IndexTTS2][Ambient] _loadScene: sceneName=' + sceneName + ' dirHandle=' + (dirHandle ? dirHandle.name : 'NULL'));
-            if (!dirHandle) { console.warn('[IndexTTS2][Ambient] _loadScene: dirHandle is null, 请在设置中选择背景音目录'); return null; }
+            const remoteUrl = async () => {
+                const blob = await loadRemoteScene(sceneName);
+                return blob?.size ? URL.createObjectURL(blob) : null;
+            };
+            if (!dirHandle) return remoteUrl();
             try {
                 // First try queryPermission (no gesture needed)
                 let hasPerm = await queryPermission();
@@ -882,7 +1079,7 @@
                     // Try reading directly — some browsers allow read without explicit grant
                     console.warn('[IndexTTS2][Ambient] 权限未授权，请在设置面板点击「🔄 授权」按钮');
                     if (window.toastr) window.toastr.warning('背景音需要授权：请打开 IndexTTS2 设置 → 背景音效 → 点击「🔄 授权」', { timeOut: 6000 });
-                    return null;
+                    return remoteUrl();
                 }
                 // Try candidate file names: exact, plus common extensions
                 const candidates = [
@@ -901,17 +1098,23 @@
                 }
                 console.warn('[IndexTTS2][Ambient] _loadScene: no matching file for scene:', sceneName, '— tried:', candidates);
             } catch (e) { console.warn('[IndexTTS2][Ambient] loadScene error:', e); }
-            return null;
+            return remoteUrl();
         }
 
         async function playScene(sceneName) {
-            if (!sceneName) { stop(); return; }
+            if (typeof sceneName !== 'string' || !sceneName) { stop(); return; }
+            sceneName = sceneName.trim().normalize('NFC');
             // Same scene — keep playing without restart
             if (sceneName === currentScene && currentAudio && !currentAudio.paused) return;
 
+            const request = ++requestNumber;
             const url = await _loadScene(sceneName);
+            if (request !== requestNumber) {
+                if (url) URL.revokeObjectURL(url);
+                return;
+            }
             if (!url) {
-                // No file found — silently do nothing
+                stop();
                 console.log('[IndexTTS2][Ambient] no file for scene:', sceneName);
                 return;
             }
@@ -925,26 +1128,23 @@
             currentAudio = audio;
 
             // Fade out old audio
-            if (oldAudio && !oldAudio.paused) {
-                _fadeOut(oldAudio, null);
-            } else {
-                _cancelFade();
-            }
+            _cancelFade();
+            if (oldAudio) releaseAudio(oldAudio);
 
             try {
                 console.log('[IndexTTS2][Ambient] playScene: calling audio.play() for scene:', sceneName);
                 await audio.play();
+                if (currentAudio !== audio) return;
                 console.log('[IndexTTS2][Ambient] playScene: audio.play() succeeded');
                 _fadeIn(audio);
             } catch (e) {
                 console.warn('[IndexTTS2][Ambient] play error:', e);
-                currentAudio = null;
-                currentScene = null;
-                URL.revokeObjectURL(url);
+                if (currentAudio === audio) { currentAudio = null; currentScene = null; releaseAudio(audio); }
             }
         }
 
         function stop() {
+            ++requestNumber;
             currentScene = null;
             if (currentAudio) {
                 _fadeOut(currentAudio, null);
@@ -953,11 +1153,11 @@
         }
 
         function stopImmediate() {
+            ++requestNumber;
             _cancelFade();
             currentScene = null;
             if (currentAudio) {
-                currentAudio.pause();
-                currentAudio.src = '';
+                releaseAudio(currentAudio);
                 currentAudio = null;
             }
         }
@@ -975,7 +1175,7 @@
 
         function getVolume() { return _getVolume(); }
 
-        return { init, setDirHandle, getDirHandle, requestPermission, playScene, stop, stopImmediate, setVolume, getVolume };
+        return { init, setDirHandle, getDirHandle, requestPermission, prepareScene, playScene, stop, stopImmediate, setVolume, getVolume, loadPreviewUrl: _loadScene };
     })();
 
     async function generateHash(character, voiceId, text, speed, volume, emotion) {
@@ -1207,7 +1407,7 @@
             }
 
             const displayLine = /^([^\[\]<>:：]{1,60})[:：]\s*(“(.+)”|「(.+)」)\s*$/.exec(trimmed);
-            if (displayLine) {
+            if (displayLine && isDetectedSpeaker(displayLine[1].trim())) {
                 const dialogue = (displayLine[3] ?? displayLine[4]).trim();
                 if (dialogue) return { character: displayLine[1].trim(), dialogue, rawContent: displayLine[2],
                     isAction: false, isQuoted: true, emotion: null };
@@ -1219,20 +1419,34 @@
         return null;
     }
 
+    function isDetectedSpeaker(name) {
+        return /^[\p{L}][\p{L}\p{M}\p{N} ._'’·-]{0,23}$/u.test(name)
+            && !/^(?:上午|下午|早上|晚上|凌晨|中午)[一二三四五六七八九十零\d]/.test(name);
+    }
+
+    function hiddenSpeakersForCard(settings, cardId) {
+        if (!settings.hiddenSpeakers || typeof settings.hiddenSpeakers !== 'object') settings.hiddenSpeakers = {};
+        if (!Array.isArray(settings.hiddenSpeakers[cardId])) settings.hiddenSpeakers[cardId] = [];
+        return settings.hiddenSpeakers[cardId];
+    }
 
     function getMergedCharacterList() {
         const characters = new Set();
+        const hidden = new Set(hiddenSpeakersForCard(getSettings(), getCardId()));
         // 1. History
         document.querySelectorAll('.mes[is_user="false"] .mes_text').forEach(mesText => {
             parseMessageDialogues(mesText.closest('.mes'), mesText.innerText).forEach(parsed => {
-                if (parsed?.character && !['旁白', 'Narrator'].includes(parsed.character)) {
+                if (parsed?.character && !hidden.has(parsed.character)
+                    && !['旁白', 'Narrator'].includes(parsed.character) && isDetectedSpeaker(parsed.character)) {
                     characters.add(parsed.character);
                 }
             });
         });
         // 2. Saved & Manual
         const voiceMap = getVoiceMap();
-        Object.keys(voiceMap).forEach(k => characters.add(k));
+        Object.keys(voiceMap).forEach(name => {
+            if (!hidden.has(name) && (voiceMap[name] || isDetectedSpeaker(name))) characters.add(name);
+        });
 
         return Array.from(characters).sort();
     }
@@ -1310,7 +1524,8 @@
 
         try {
             let res;
-            if (settings.mobileTransport === 'tavern') res = await tavernPost(settings, 'speech', payload);
+            if (useAudioWorkflow(settings)) res = await audioWorkflowPost(settings, 'speech', payload);
+            else if (settings.mobileTransport === 'tavern') res = await tavernPost(settings, 'speech', payload);
             else if (await useMobileRelay(settings)) res = await relayPost('/speech', payload);
             else res = await directFetch(directEndpoint(settings.apiUrl, '/api/v1/tts/tasks'), {
                     method: 'POST',
@@ -1358,6 +1573,8 @@
         // Explicitly check for false, default to true
         const allowFetch = ctx.autoInfer === false ? false : true;
         const emotion = ctx.emotion || null;
+        const scene = ctx.scene || null;
+        void AmbientPlayer.prepareScene(scene);
         let msg = ctx.msg || null;
         const encT = ctx.encT || utf8ToBase64(text);
         const encC = ctx.encC || utf8ToBase64(character || '');
@@ -1388,6 +1605,7 @@
                     encC,
                     character,
                     text: cleanText,
+                    scene,
                     volume: ctx.volume
                 });
                 return;
@@ -1411,6 +1629,7 @@
             encC,
             character,
             text,
+            scene,
             volume: record.volume,
             shouldRevoke: true
         });
@@ -1419,7 +1638,7 @@
     /**
      * Helper to handle audio playback from a known record or URL
      */
-    async function playAudioFromRecord({ blobUrl, msg, encT, encC, character, text, volume, shouldRevoke = false }) {
+    async function playAudioFromRecord({ blobUrl, msg, encT, encC, character, text, scene, volume, shouldRevoke = false }) {
         const audio = new Audio(blobUrl);
         const settings = getSettings();
         const vol = isNaN(volume) ? (settings.volume || 1.0) : Math.max(0, Math.min(1, volume));
@@ -1434,6 +1653,7 @@
         if (currentPlayback.audio) {
             try { currentPlayback.audio.pause(); } catch (e) { }
         }
+        AmbientPlayer.stopImmediate();
 
         // Clear global context when single playing
         currentPlayback = {
@@ -1449,6 +1669,7 @@
         attachMiniPlayerToAudio(audio, false);
 
         const cleanup = () => {
+            if (currentPlayback.audio === audio) AmbientPlayer.stop();
             if (shouldRevoke) URL.revokeObjectURL(blobUrl);
             if (msg) {
                 setLinePlayingByEncoded(msg, encT, encC, false);
@@ -1460,6 +1681,7 @@
 
         try {
             await audio.play();
+            if (currentPlayback.audio === audio) void AmbientPlayer.playScene(scene);
             if (window.toastr) window.toastr.success('播放中...');
         } catch (e) {
             cleanup();
@@ -1486,7 +1708,9 @@
             const uploadFileName = originalFileName || (characterName + '.wav');
             if (base64Audio.length > 20 * 1024 * 1024) throw new Error('参考音频太大，请截取一小段后再上传。');
             let res;
-            if (settings.mobileTransport === 'tavern') {
+            if (useAudioWorkflow(settings)) {
+                res = await audioWorkflowPost(settings, 'upload', { filename: uploadFileName, audio: base64Audio });
+            } else if (settings.mobileTransport === 'tavern') {
                 res = await tavernPost(settings, 'upload', { filename: uploadFileName, audio: base64Audio });
             } else if (await useMobileRelay(settings)) {
                 res = await relayPost('/upload', { filename: uploadFileName, audio: base64Audio });
@@ -1528,6 +1752,8 @@
         const cardName = getCardName();
         const settings = getSettings();
         const voiceMap = getVoiceMap();
+        const hiddenSpeakers = hiddenSpeakersForCard(settings, cardId);
+        let catalogRequest = 0;
 
         const renderListResults = () => {
             const characters = getMergedCharacterList();
@@ -1538,16 +1764,17 @@
                 ? '<div class="indextts-empty">未检测到角色 [角色|...]|「对话」</div>'
                 : characters.map(char => {
                     const voice = voiceMap[char];
-                    const isConfigured = !!voice;
+                const safeName = fieldValue(char);
                     return `
-                <div class="indextts-char-row" data-char="${char}">
-                    <div class="indextts-char-name" title="${char}">${char}</div>
+                <div class="indextts-char-row" data-char="${safeName}">
+                    <div class="indextts-char-name" title="${safeName}">${safeName}</div>
                     <div class="indextts-char-audio">
-                        <select class="indextts-voice-select text_pole" data-char="${char}">
+                        <select class="indextts-voice-select text_pole" data-char="${safeName}">
                             <option value="">-- 加载中... --</option>
                         </select>
-                        <input type="text" class="indextts-voice-input text_pole" data-char="${char}" value="${voice || ''}" placeholder="文件名.wav">
-                        <div class="indextts-del-btn" data-char="${char}" title="删除配置"><i class="fa-solid fa-trash"></i></div>
+                        <input type="text" class="indextts-voice-input text_pole" data-char="${safeName}" value="${fieldValue(String(voice || ''))}" placeholder="文件名.wav">
+                        <button type="button" class="menu_button indextts-reference-preview">试听</button>
+                        <div class="indextts-del-btn" data-char="${safeName}" title="移除条目"><i class="fa-solid fa-trash"></i></div>
                     </div>
                 </div>
             `}).join('');
@@ -1584,6 +1811,10 @@
                     <button class="menu_button" id="indextts-import"><i class="fa-solid fa-file-import"></i> 导入全部</button>
                     <button class="menu_button" id="indextts-export"><i class="fa-solid fa-file-export"></i> 导出全部</button>
                 </div>
+                <div class="indextts-quick-actions">
+                    <select id="indextts-voice-library" class="text_pole" aria-label="选择试听音色"><option value="">选择试听音色</option></select>
+                    <button type="button" class="menu_button" id="indextts-library-preview">试听</button>
+                </div>
                 <div id="indextts-voice-list-state" role="status"></div>
                 <div class="indextts-char-list" id="indextts-char-list-container"></div>
                 <div class="indextts-popup-footer">
@@ -1593,6 +1824,14 @@
             </div>
         `;
         document.body.appendChild(modal);
+
+        const library = modal.querySelector('#indextts-voice-library');
+        const libraryPreview = modal.querySelector('#indextts-library-preview');
+        library.onchange = () => { if (previewSession?.button === libraryPreview) stopPreview(); };
+        libraryPreview.onclick = () => {
+            if (!library.value) { window.toastr?.warning('请先选择一个音色。'); return; }
+            void togglePreview(libraryPreview, () => voicePreviewUrl(library.value));
+        };
 
         renderListResults();
 
@@ -1656,8 +1895,12 @@
         }
 
         // Handlers
-        modal.onclick = e => { if (e.target === modal) modal.remove(); };
-        modal.querySelector('#indextts-cancel').onclick = () => modal.remove();
+        function closeVoiceConfig() {
+            if (previewSession && modal.contains(previewSession.button)) stopPreview();
+            modal.remove();
+        }
+        modal.onclick = e => { if (e.target === modal) closeVoiceConfig(); };
+        modal.querySelector('#indextts-cancel').onclick = closeVoiceConfig;
 
         // Add Character
         const addBtn = modal.querySelector('#indextts-add-btn');
@@ -1665,6 +1908,8 @@
         const doAdd = () => {
             const name = addInput.value.trim();
             if (name) {
+                const hiddenIndex = hiddenSpeakers.indexOf(name);
+                if (hiddenIndex >= 0) hiddenSpeakers.splice(hiddenIndex, 1);
                 if (!voiceMap[name]) {
                     voiceMap[name] = ""; // Keep empty to indicate manually added but no voice
                 }
@@ -1683,16 +1928,13 @@
                 let val = input.value.trim();
                 if (val) {
                     voiceMap[char] = ensureWavSuffix(val);
-                } else {
-                    // If manually added and cleared, do we delete?
-                    // Proposal: keep key if it was manually added?
-                    // Simplify: Just update value. If empty string, it remains empty in voiceMap (so it persists).
+                } else if (Object.hasOwn(voiceMap, char)) {
                     voiceMap[char] = "";
                 }
             });
             saveSettings();
             if (window.toastr) window.toastr.success('已保存');
-            modal.remove();
+            closeVoiceConfig();
             refreshAllMessages();
         };
 
@@ -1735,12 +1977,25 @@
         };
 
         function bindRowEvents(container) {
+            container.querySelectorAll('.indextts-reference-preview').forEach(button => {
+                button.onclick = () => {
+                    const input = button.parentElement.querySelector('.indextts-voice-input');
+                    const name = ensureWavSuffix(input.value.trim());
+                    if (!name) {
+                        window.toastr?.warning('请先选择一个音色。');
+                        return;
+                    }
+                    void togglePreview(button, () => voicePreviewUrl(name));
+                };
+            });
             // Delete
             container.querySelectorAll('.indextts-del-btn').forEach(btn => {
                 btn.onclick = () => {
                     const char = btn.dataset.char;
-                    if (confirm(`确定要移除角色 "${char}" 的配置吗？`)) {
+                    if (confirm(`从当前角色卡的配音列表移除 "${char}"？需要时可以手动添加回来。`)) {
+                        if (previewSession && container.contains(previewSession.button)) stopPreview();
                         delete voiceMap[char];
+                        if (!hiddenSpeakers.includes(char)) hiddenSpeakers.push(char);
                         saveSettings();
                         renderListResults();
                     }
@@ -1764,15 +2019,19 @@
 
             const settings = getSettings();
             const listUrl = directEndpoint(settings.voiceListUrl, '/api/v1/voices');
-            const catalogKey = `voiceCatalog:${settings.mobileTransport}:${listUrl}`;
+            const catalogKey = `voiceCatalog:v2:${settings.mobileTransport}:${listUrl}`;
             const state = modal.querySelector('#indextts-voice-list-state');
             const selects = [...container.querySelectorAll('.indextts-voice-select')];
             const inputs = [...container.querySelectorAll('.indextts-voice-input')];
+            const request = ++catalogRequest;
             function fillChoices(names) {
+                const previewName = library.value;
+                library.replaceChildren(new Option('选择试听音色', ''), ...groupedVoiceChoices(names));
+                if (names.includes(previewName)) library.value = previewName;
                 for (const sel of selects) {
                     const char = sel.dataset.char;
                     const currentVoice = voiceMap[char] || '';
-                    sel.replaceChildren(new Option('-- 请选择参考音频 --', ''), ...names.map(name => new Option(name, name)));
+                    sel.replaceChildren(new Option('-- 请选择参考音频 --', ''), ...groupedVoiceChoices(names));
                     if (currentVoice && !names.includes(currentVoice)) sel.add(new Option(`${currentVoice}（手动）`, currentVoice));
                     sel.value = currentVoice;
                     sel.onchange = () => {
@@ -1786,13 +2045,13 @@
 
             state.textContent = '正在读取音色列表…';
             loadVoiceNames(settings).then(({ names, transport }) => {
-                if (!selects[0]?.isConnected) return;
+                if (!modal.isConnected || request !== catalogRequest) return;
                 fillChoices(names);
                 state.textContent = `${transportLabel(transport)} · ${names.length} 条音色`;
                 AudioStorage.saveConfig(catalogKey, names).catch(() => {});
             }).catch(async error => {
                 const saved = await AudioStorage.getConfig(catalogKey).catch(() => null);
-                if (!selects[0]?.isConnected) return;
+                if (!modal.isConnected || request !== catalogRequest) return;
                 const names = Array.isArray(saved) ? saved : installedVoiceNames;
                 fillChoices(names);
                 const reason = error instanceof TypeError ? 'App 内的网络请求失败，请检查中继或局域网权限。' : error.message;
@@ -1889,6 +2148,7 @@
             const enc = utf8ToBase64(vn.parsed.dialogue);
             const charEnc = utf8ToBase64(vn.parsed.character);
             const emotionEnc = vn.parsed.emotion || '';
+            const sceneEnc = utf8ToBase64(vn.parsed.scene || '');
 
             // 仅在原 HTML 中查找「带引号的对话」部分（第二组）
             const rawContent = vn.parsed.rawContent;
@@ -1906,7 +2166,7 @@
                 if (match.includes('indextts-dialogue')) return match;
                 modified = true;
 
-                return `<span class="indextts-dialogue" data-t="${enc}" data-v="${vn.voice || ''}" data-c="${charEnc}" data-e="${emotionEnc}" title="点击播放">${match}</span><span class="indextts-inline-play" data-t="${enc}" data-v="${vn.voice || ''}" data-c="${charEnc}" data-e="${emotionEnc}" title="播放"><i class="fa-solid fa-play fa-xs"></i></span>`;
+                return `<span class="indextts-dialogue" data-t="${enc}" data-v="${vn.voice || ''}" data-c="${charEnc}" data-e="${emotionEnc}" data-s="${sceneEnc}" title="点击播放">${match}</span><span class="indextts-inline-play" data-t="${enc}" data-v="${vn.voice || ''}" data-c="${charEnc}" data-e="${emotionEnc}" data-s="${sceneEnc}" title="播放"><i class="fa-solid fa-play fa-xs"></i></span>`;
             });
         }
 
@@ -1924,7 +2184,7 @@
                     const character = base64ToUtf8(span.dataset.c || '');
                     const emotion = span.dataset.e || null;
                     const msgEl = span.closest('.mes');
-                    playSingleLine(text, voice, character, { msg: msgEl, encT: span.dataset.t, encC: span.dataset.c, emotion });
+                    playSingleLine(text, voice, character, { msg: msgEl, encT: span.dataset.t, encC: span.dataset.c, emotion, scene: base64ToUtf8(span.dataset.s || '') });
                 };
             });
 
@@ -1939,7 +2199,7 @@
                     const character = base64ToUtf8(btn.dataset.c || '');
                     const emotion = btn.dataset.e || null;
                     const msgEl = btn.closest('.mes');
-                    playSingleLine(text, voice, character, { msg: msgEl, encT: btn.dataset.t, encC: btn.dataset.c, emotion });
+                    playSingleLine(text, voice, character, { msg: msgEl, encT: btn.dataset.t, encC: btn.dataset.c, emotion, scene: base64ToUtf8(btn.dataset.s || '') });
                 };
             });
         }
@@ -2785,6 +3045,7 @@
                 }
 
                 try {
+                    void AmbientPlayer.prepareScene(line.scene);
                     const record = await ensureAudioRecord({
                         text: line.text,
                         character: line.character,
@@ -3402,6 +3663,7 @@
                                 <label for="indextts-mobile-transport">连接方式</label>
                                 <select id="indextts-mobile-transport" class="text_pole">
                                     <option value="auto" ${settings.mobileTransport === 'auto' ? 'selected' : ''}>自动选择</option>
+                                    <option value="workflow" ${settings.mobileTransport === 'workflow' ? 'selected' : ''}>TauriTavern 局域网连接</option>
                                     <option value="tavern" ${settings.mobileTransport === 'tavern' ? 'selected' : ''}>酒馆内置转发</option>
                                     <option value="relay" ${settings.mobileTransport === 'relay' ? 'selected' : ''}>手机本机中继</option>
                                     <option value="direct" ${settings.mobileTransport === 'direct' ? 'selected' : ''}>局域网直连</option>
@@ -3537,6 +3799,11 @@
                             <div class="indextts-setting-row">
                                 <button type="button" class="menu_button" id="indextts-ambient-files">导入背景音文件</button>
                                 <span id="indextts-mobile-scene-count" role="status"></span>
+                            </div>
+                            <div class="indextts-setting-row">
+                                <label for="indextts-scene-preview-select">试听场景音</label>
+                                <select id="indextts-scene-preview-select" class="text_pole"><option value="">正在读取场景音…</option></select>
+                                <button type="button" class="menu_button" id="indextts-scene-preview">试听</button>
                             </div>
                             <div class="indextts-setting-row">
                                 <label>场景音音量</label>
@@ -3799,11 +4066,45 @@
 
         // ==================== Module 4: Ambient Sound ====================
         const sceneCount = panel.querySelector('#indextts-mobile-scene-count');
+        const sceneSelect = panel.querySelector('#indextts-scene-preview-select');
+        const scenePreview = panel.querySelector('#indextts-scene-preview');
+        async function refreshSceneChoices() {
+            const selected = sceneSelect.value;
+            const local = await AudioStorage.getConfig('mobileSceneNames').catch(() => null);
+            const names = new Set(Array.isArray(local) ? local : []);
+            const dir = AmbientPlayer.getDirHandle();
+            try {
+                if (dir) {
+                    for await (const file of dir.values()) {
+                        if (file.kind === 'file' && /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(file.name)) {
+                            names.add(file.name.replace(/\.[^.]+$/, ''));
+                        }
+                    }
+                }
+            } catch { /* Unavailable handles can still use imported or server audio. */ }
+            try {
+                const catalog = await (await previewRequest(getSettings(), 'scenes')).json();
+                if (Array.isArray(catalog.names)) catalog.names.filter(name => typeof name === 'string').forEach(name => names.add(name));
+            } catch { /* Keep local choices available while the server is offline. */ }
+            sceneSelect.replaceChildren(new Option(names.size ? '选择场景音' : '暂无可试听的场景音', ''),
+                ...Array.from(names).sort((a, b) => a.localeCompare(b, 'zh-CN')).map(name => new Option(name, name)));
+            if (names.has(selected)) sceneSelect.value = selected;
+        }
+        void refreshSceneChoices();
+        sceneSelect.onchange = () => { if (previewSession?.button === scenePreview) stopPreview(); };
+        scenePreview.onclick = () => {
+            if (!sceneSelect.value) {
+                window.toastr?.warning('请先选择一个场景音。');
+                return;
+            }
+            void togglePreview(scenePreview, () => AmbientPlayer.loadPreviewUrl(sceneSelect.value));
+        };
         function showSceneCount(count) { sceneCount.textContent = count ? `手机已导入 ${count} 条` : ''; }
         AudioStorage.getConfig('mobileSceneNames').then(names => showSceneCount(names?.length)).catch(() => {});
         const chooseSceneFiles = () => pickAudioFiles(async files => {
             const count = await importSceneFiles(files);
             showSceneCount(count);
+            void refreshSceneChoices();
             window.toastr?.success(`手机已保存 ${count} 条背景音`);
         }, 'audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac');
         panel.querySelector('#indextts-ambient-files').onclick = chooseSceneFiles;
@@ -3826,6 +4127,7 @@
                     s.ambientSoundPath = h.name;
                     saveSettings();
                     if (window.toastr) window.toastr.success('背景音目录已设置: ' + h.name);
+                    void refreshSceneChoices();
                 } catch (e) {
                     if (e.name !== 'AbortError') window.toastr?.warning('目录选择不可用，请点「导入背景音文件」。');
                 }
